@@ -4,3 +4,4 @@ cache/
 plan-*.md
 __pycache__/
 out-repro/
+forge-out/

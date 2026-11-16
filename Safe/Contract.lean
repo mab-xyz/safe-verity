@@ -29,6 +29,20 @@ verity_intrinsic gasleft (tag : Uint256) : Uint256
 def gasleftLowering : Verity.Core.Intrinsics.YulLowering :=
   .template ["tag"] "g" [Compiler.Yul.YulStmt.assign "g" (Compiler.Yul.YulExpr.call "gas" [])]
 
+-- `return(p, size)` from memory. The fork's `returnArray` copies a memory array from calldata,
+-- so `getOwners` ABI-encodes its result by hand and returns it with this.
+verity_intrinsic memReturn (p : Uint256, size : Uint256) : Uint256
+  where pure;
+        yul := [template (p, size) -> r := [ yulcall «return»(p, size) ]];
+        min_fork := cancun;
+        semantics := (fun _ _ => (0 : Verity.Core.Uint256));
+        obligation [mem_return_ends_call := assumed "Yul return(p, size); ends the call with that memory slice"]
+
+def memReturnLowering : Verity.Core.Intrinsics.YulLowering :=
+  .template ["p", "size"] "r"
+    [Compiler.Yul.YulStmt.exprStmt (Compiler.Yul.YulExpr.call "return"
+      [Compiler.Yul.YulExpr.ident "p", Compiler.Yul.YulExpr.ident "size"])]
+
 set_option linter.unusedVariables false in
 verity_contract Safe where
   storage
@@ -38,7 +52,7 @@ verity_contract Safe where
     ownerCount : Uint256 := slot 3
     threshold : Uint256 := slot 4
     nonceSlot : Uint256 := slot 5
-    approvedHashes : Address → Uint256 → Uint256 := slot 8
+    approvedHashesSlot : Address → Uint256 → Uint256 := slot 8
 
   event_defs
     event ApproveHash(@indexed approvedHash : Bytes32, @indexed owner : Address)
@@ -57,7 +71,7 @@ verity_contract Safe where
     -- bytes2(0x1901) left-aligned
     eip712Prefix : Uint256 := 11309588061646438093662687302255421419811724423900836950936401294474059186176
     -- "\x19Ethereum Signed Message:\n32" left-aligned (28 bytes)
-    ethSignPrefix : Uint256 := 11619269278091512237283962264449283493023592493406153389659224429998651965440
+    ethSignPrefix : Uint256 := 11430537079145650693387304458692941425836787954612963690241153482819318579200
     addrMask : Uint256 := 1461501637330902918203684832716283019655932542975
     transferSelector : Uint256 := 76450787359836037641860180984291677749980919077056822294353438043884394381312
     maxWord : Uint256 := 115792089237316195423570985008687907853269984665640564039457584007913129639935
@@ -82,16 +96,16 @@ verity_contract Safe where
     require (_threshold <= n) "GS201"
     require (_threshold >= 1) "GS202"
     let self ← contractAddress
+    let mut current := sentinel
     forEach "i" n (do
       let owner := arrayElement _owners i
-      let current := if i == 0 then sentinel else addressToWord (arrayElement _owners (sub i 1))
       require (owner != zeroAddress && addressToWord owner != sentinel && owner != self
         && addressToWord owner != current) "GS203"
       let existing ← getMapping owners owner
       require (existing == 0) "GS204"
-      setMapping owners (wordToAddress current) (addressToWord owner))
-    let last := if n == 0 then sentinel else addressToWord (arrayElement _owners (sub n 1))
-    setMapping owners (wordToAddress last) sentinel
+      setMapping owners (wordToAddress current) (addressToWord owner)
+      current := addressToWord owner)
+    setMapping owners (wordToAddress current) sentinel
     setStorage ownerCount n
     setStorage threshold _threshold
     -- setupModules(address(0), ""): initialises the module list.
@@ -117,12 +131,16 @@ verity_contract Safe where
     let sender ← msgSender
     let o ← getMapping owners sender
     require (o != 0) "GS030"
-    setMappingN approvedHashes [sender, hashToApprove] 1
+    setMappingN approvedHashesSlot [sender, hashToApprove] 1
     emit "ApproveHash" [hashToApprove, sender]
 
   function view nonce () : Uint256 := do
     let n ← getStorage nonceSlot
     return n
+
+  function view approvedHashes (owner : Address, hash : Bytes32) : Uint256 := do
+    let a ← getMappingN approvedHashesSlot [owner, hash]
+    return a
 
   function view getThreshold () : Uint256 := do
     let t ← getStorage threshold
@@ -156,16 +174,22 @@ verity_contract Safe where
     return ds
 
 
+  -- Returns address[] (ABI-encoded by hand, see `memReturn`).
   function getOwners ()
-    local_obligations [safe_free_memory_scratch := assumed "Scratch buffer at the free memory pointer; tested differentially against solc Safe 1.4.1."]
-    : Array Uint256 := do  -- address[] on the wire
+    local_obligations [safe_free_memory_scratch := assumed "Result encoded at the free memory pointer and returned with memReturn; tested against solc Safe 1.4.1."]
+    : Uint256 := do
     let count ← getStorage ownerCount
-    let arr ← allocArray count
+    let p := mload 64
+    unsafe "ABI head: offset and length" do
+      mstore p 32
+      mstore (add p 32) count
     let mut current ← getMapping owners (wordToAddress sentinel)
     forEach "i" count (do
-      setMemoryArrayElement arr i current
+      unsafe "element i" do
+        mstore (add p (add 64 (mul 32 i))) current
       current ← getMapping owners (wordToAddress current))
-    returnArray arr
+    let done := intrinsic_cancun "memReturn" memReturnLowering [p, add 64 (mul 32 count)]
+    return done
 
   -- Safe 1.4.1 `execTransaction`, without guard hooks (no guard can be set).
   function payable reentrancy_trusted execTransaction (target : Address, value : Uint256,
@@ -241,7 +265,7 @@ verity_contract Safe where
           mstore (add q 196) csLen
           mstore (add q (add 196 padded)) 0
           calldatacopy (add q 228) (add sigBase (add s 32)) csLen
-        let ok := staticcall (gasleft 4) currentOwner q (add 228 padded) 0 0
+        let ok := staticcall (intrinsic_cancun "gasleft" gasleftLowering [4]) currentOwner q (add 228 padded) 0 0
         if ok == 0 then revertReturndata else pure ()
         if returndataSize < 32 then revertEmpty else pure ()
         unsafe "abi.decode(returndata, (bytes4))" do
@@ -253,7 +277,7 @@ verity_contract Safe where
           -- Approved hash: the approver is r; msg.sender approves implicitly.
           currentOwner := and r addrMask
           let sender ← msgSender
-          let approved ← getMappingN approvedHashes [wordToAddress currentOwner, txHash]
+          let approved ← getMappingN approvedHashesSlot [wordToAddress currentOwner, txHash]
           require (addressToWord sender == currentOwner || approved != 0) "GS025"
         else
           if v > 30 then
@@ -271,10 +295,10 @@ verity_contract Safe where
       require (currentOwner > lastOwner && isOwnerWord != 0 && currentOwner != sentinel) "GS026"
       lastOwner := currentOwner)
     -- 1/64 rule and event headroom, Solidity 0.7 wrapping arithmetic.
-    let g0 := gasleft 1
+    let g0 := intrinsic_cancun "gasleft" gasleftLowering [1]
     require (g0 >= add (max (div (mul safeTxGas 64) 63) (add safeTxGas 2500)) 500) "GS010"
-    let gasStart := gasleft 2
-    let txGas := if gasPrice_ == 0 then sub (gasleft 3) 2500 else safeTxGas
+    let gasStart := intrinsic_cancun "gasleft" gasleftLowering [2]
+    let txGas := if gasPrice_ == 0 then sub (intrinsic_cancun "gasleft" gasleftLowering [3]) 2500 else safeTxGas
     let d := mload 64
     unsafe "execute: data to memory" do
       copyBytes data d
@@ -283,7 +307,7 @@ verity_contract Safe where
       success := delegatecall txGas (addressToWord target) d (bytesLength data) 0 0
     else
       success := call txGas (addressToWord target) value d (bytesLength data) 0 0
-    let gasEnd := gasleft 5
+    let gasEnd := intrinsic_cancun "gasleft" gasleftLowering [5]
     if gasEnd > gasStart then revertEmpty else pure ()
     let gasUsed := sub gasStart gasEnd
     require (success == 1 || safeTxGas != 0 || gasPrice_ != 0) "GS013"
@@ -308,7 +332,7 @@ verity_contract Safe where
           mstore q transferSelector
           mstore (add q 4) receiver
           mstore (add q 36) payment
-        let ok := call (sub (gasleft 6) 10000) (addressToWord gasToken) 0 q 68 q 32
+        let ok := call (sub (intrinsic_cancun "gasleft" gasleftLowering [6]) 10000) (addressToWord gasToken) 0 q 68 q 32
         let rds := returndataSize
         let word := mload q
         let transferred := if rds == 0 then ok else (if rds == 32 then (if ok == 1 && word != 0 then 1 else 0) else 0)
