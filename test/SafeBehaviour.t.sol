@@ -359,6 +359,17 @@ abstract contract SafeBehaviour is SafeDeployer {
         assertTrue(_exec(t, abi.encodePacked(_approved(owners[0]), _sign(keys[1], h))));
     }
 
+    function test_exec_sentinelAsApprover_GS026() public {
+        // owners[SENTINEL] is non-zero (it heads the owner list), so only the explicit
+        // currentOwner != SENTINEL check stops address(1) from counting as an owner.
+        SafeTx memory t = _call(address(target), 0, "");
+        bytes32 h = _txHash(safe, t, 0);
+        bytes memory sigs = abi.encodePacked(_approved(SENTINEL), _sign(keys[1], h));
+        vm.prank(SENTINEL);
+        _expectRevertGS("GS026");
+        _exec(t, sigs);
+    }
+
     function test_exec_notApproved_GS025() public {
         SafeTx memory t = _call(address(target), 0, "");
         bytes32 h = _txHash(safe, t, 0);
@@ -593,6 +604,7 @@ abstract contract SafeBehaviour is SafeDeployer {
         assertEq(receiver.balance, payment, "receiver got the logged payment");
         assertEq(payment % 1 gwei, 0, "price is min(gasPrice, tx.gasprice)");
         assertGt(payment / 1 gwei, 21_000, "gasUsed + baseGas");
+        assertLt(payment, 1_000_000 gwei, "priced at tx.gasprice (1 gwei), not the signed 100 gwei");
     }
 
     function test_refund_eth_toOrigin() public {
