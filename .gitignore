@@ -1,0 +1,6 @@
+.lake
+out/
+cache/
+plan-*.md
+__pycache__/
+out-repro/
