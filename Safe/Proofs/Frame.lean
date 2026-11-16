@@ -175,6 +175,16 @@ theorem loopList_chain {σ : Type} (s0 : ContractState) (body : Nat → σ → C
         rw [hr]; cases outs <;> simp [List.getLastD]
       · cases h
 
+theorem StepChain.get {σ : Type} {P : Nat → σ → Prop} {R : σ → σ → Prop} :
+    ∀ {idx : List Nat} {a : σ} {outs : List σ}, StepChain P R idx a outs →
+      ∀ k (hk : k < outs.length), P (idx.getD k 0) outs[k]
+  | [], _, [], _, k, hk => absurd hk (by simp)
+  | _ :: _, _, _ :: _, ⟨_, hP, _⟩, 0, _ => by simpa using hP
+  | _ :: _, _, _ :: _, ⟨_, _, h⟩, k + 1, hk => by
+      simpa using StepChain.get h k (by simpa using hk)
+  | [], _, _ :: _, h, _, _ => h.elim
+  | _ :: _, _, [], h, _, _ => h.elim
+
 /-- Starting below every element and stepping by `<`, the loop states are strictly increasing. -/
 theorem StepChain.pairwise_lt {P : Nat → Uint256 → Prop} :
     ∀ {idx : List Nat} {a : Uint256} {outs : List Uint256},

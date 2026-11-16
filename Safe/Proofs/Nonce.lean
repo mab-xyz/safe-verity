@@ -142,6 +142,17 @@ theorem domainSeparatorHash_spec (ctx : ExecutableCallContext) (s : ContractStat
   rw [show (96 : Verity.Core.Uint256).val = 96 from rfl, keccak3 _ _ _ _ _ 96 rfl]
   exact ⟨_, rfl⟩
 
+/-- `keccak256(p, size)` over two words written at `p, p + 32` (size 33..64). -/
+theorem keccak2 (m : Nat → Uint256) (p w0 w1 : Uint256) (size : Nat) (hsize : (size + 31) / 32 = 2) :
+    Verity.Core.Uint256.ofNat (Compiler.Keccak.MemorySlice.keccak
+        (fun x => (wr (wr m p w0) (Verity.EVM.Uint256.add p 32) w1 x).val) p.val size) =
+      Spec.keccakWords [w0.val, w1.val] size := by
+  apply keccak_eq_keccakWords
+  rw [words_eq, hsize]
+  simp only [show List.range 2 = [0, 1] from rfl, List.map_cons, List.map_nil, Nat.reduceMul,
+    Nat.zero_mul, Nat.one_mul]
+  simp (disch := first | decide | norm_num) only [wr_off, wr_off0, ↓reduceIte, Nat.reduceEqDiff]
+
 /-- `keccak256(p, 352)` over eleven words written at `p, p + 32, …, p + 320`. -/
 theorem keccak11 (m : Nat → Uint256) (p w0 w1 w2 w3 w4 w5 w6 w7 w8 w9 w10 : Uint256) :
     Verity.Core.Uint256.ofNat (Compiler.Keccak.MemorySlice.keccak
