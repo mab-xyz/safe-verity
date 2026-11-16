@@ -224,10 +224,12 @@ verity_contract Safe where
       mstore (add p 288) (addressToWord refundReceiver)
       mstore (add p 320) n
     let safeTxHash := keccak256 p 352
-    unsafe "txHashData = abi.encodePacked(0x19, 0x01, domainSeparator, safeTxHash)" do
-      mstore p eip712Prefix
-      mstore (add p 2) ds
-      mstore (add p 34) safeTxHash
+    -- txHashData = abi.encodePacked(0x19, 0x01, domainSeparator, safeTxHash), 66 bytes, written as
+    -- three aligned words (the EDSL memory is word-keyed: unaligned stores would not overlap).
+    unsafe "txHashData in free memory, aligned words" do
+      mstore p (or eip712Prefix (shr 16 ds))
+      mstore (add p 32) (or (shl 240 ds) (shr 16 safeTxHash))
+      mstore (add p 64) (shl 240 safeTxHash)
     let txHash := keccak256 p 66
     setStorage nonceSlot (add n 1)
     return (txHash, safeTxHash)
@@ -292,9 +294,9 @@ verity_contract Safe where
         else
           if v > 30 then
             let q := mload 64
-            unsafe "keccak256(abi.encodePacked(\"\\x19Ethereum Signed Message:\\n32\", txHash))" do
-              mstore q ethSignPrefix
-              mstore (add q 28) txHash
+            unsafe "abi.encodePacked(\"\\x19Ethereum Signed Message:\\n32\", txHash), 60 bytes as aligned words" do
+              mstore q (or ethSignPrefix (shr 224 txHash))
+              mstore (add q 32) (shl 32 txHash)
             let prefixed := keccak256 q 60
             let signer ← ecrecover prefixed (sub v 4) r s
             currentOwner := addressToWord signer
