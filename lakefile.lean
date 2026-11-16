@@ -10,7 +10,7 @@ require verity from git
 
 @[default_target]
 lean_lib «Safe» where
-  globs := #[.andSubmodules `Safe]
+  roots := #[`Safe]
 
 /-- Emits Yul + ABI: `lake exe safe-compile OUT_DIR`. -/
 lean_exe «safe-compile» where
