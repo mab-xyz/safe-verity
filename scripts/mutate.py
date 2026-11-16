@@ -32,7 +32,7 @@ MUTANTS: dict[str, tuple[str, str]] = {
     "1271-pointer-unchecked": ("require (s >= staticPart) \"GS021\"", "require (true) \"GS021\""),
     "gs013-dropped": ("require (success == 1 || safeTxGas != 0 || gasPrice_ != 0) \"GS013\"", "pure ()"),
     "delegatecall-as-call": ("if operation == 1 then\n      success := delegatecall", "if operation == 2 then\n      success := delegatecall"),
-    "eth-refund-price-unbounded": ("let price := min gasPrice_ txPrice", "let price := gasPrice_"),
+    "eth-refund-price-unbounded": ("then min gasPrice_ txPrice else", "then gasPrice_ else"),
     "refund-receiver-ignored": ("addressToWord txSender else addressToWord refundReceiver", "addressToWord txSender else addressToWord txSender"),
     "gs010-dropped": ('require (g0 >= add (max (div (mul safeTxGas 64) 63) (add safeTxGas 2500)) 500) "GS010"', "pure ()"),
     "setup-duplicate-allowed": ('require (existing == 0) "GS204"', 'require (true) "GS204"'),

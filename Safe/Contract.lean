@@ -29,6 +29,14 @@ verity_intrinsic gasleft (tag : Uint256) : Uint256
 def gasleftLowering : Verity.Core.Intrinsics.YulLowering :=
   .template ["tag"] "g" [Compiler.Yul.YulStmt.assign "g" (Compiler.Yul.YulExpr.call "gas" [])]
 
+/-- The Lean model of `gasleft()` at call site `site`: an unknown function. Proofs cannot assume any
+value for it, so no theorem holds because of a particular gas amount (the fork's default, a `panic`,
+would make every gas check fail in the model and every "on success" theorem vacuous). -/
+opaque gasleftModel (site : Uint256) : Uint256
+
+macro_rules
+  | `(intrinsic_cancun "gasleft" $_lowering:term [$site:term]) => `(gasleftModel $site)
+
 -- `return(p, size)` from memory. The fork's `returnArray` copies a memory array from calldata,
 -- so `getOwners` ABI-encodes its result by hand and returns it with this.
 verity_intrinsic memReturn (p : Uint256, size : Uint256) : Uint256
@@ -191,15 +199,12 @@ verity_contract Safe where
     let done := intrinsic_cancun "memReturn" memReturnLowering [p, add 64 (mul 32 count)]
     return done
 
-  -- Safe 1.4.1 `execTransaction`, without guard hooks (no guard can be set).
-  function payable reentrancy_trusted execTransaction (target : Address, value : Uint256,
-      data : Bytes, operation : Uint8, safeTxGas : Uint256, baseGas : Uint256,
-      gasPrice_ : Uint256, gasToken : Address, refundReceiver : Address, signatures : Bytes)
-    local_obligations [safe_raw_memory_layout := assumed "Hashing buffers and call frames are built in free memory with mstore/calldatacopy; tested differentially against solc Safe 1.4.1.",
-      safe_low_level_calls := assumed "EIP-1271 staticcall, call/delegatecall execution, ETH send and token transfer are raw calls; their effects are the adversary model's."]
-    : Bool := do
-    -- Enum.Operation ABI decoding: values other than 0 and 1 revert.
-    if operation > 1 then revertEmpty else pure ()
+  -- Reads the nonce, returns (txHash, safeTxHash) for it, and stores nonce + 1 (Safe: `nonce++`).
+  function internal consumeNonce (target : Address, value : Uint256, data : Bytes, operation : Uint8,
+      safeTxGas : Uint256, baseGas : Uint256, gasPrice_ : Uint256, gasToken : Address,
+      refundReceiver : Address)
+    local_obligations [safe_raw_memory_layout := assumed "EIP-712 hashing buffers built in free memory with mstore/calldatacopy; tested differentially against solc Safe 1.4.1."]
+    : Tuple [Uint256, Uint256] := do
     let n ← getStorage nonceSlot
     let ds ← domainSeparatorHash
     let p := mload 64
@@ -225,14 +230,19 @@ verity_contract Safe where
       mstore (add p 34) safeTxHash
     let txHash := keccak256 p 66
     setStorage nonceSlot (add n 1)
-    -- checkSignatures(txHash, txHashData, signatures)
-    let t ← getStorage threshold
-    require (t > 0) "GS001"
-    -- checkNSignatures(txHash, txHashData, signatures, threshold)
+    return (txHash, safeTxHash)
+
+  -- Safe 1.4.1 `checkNSignatures(txHash, txHashData, signatures, t)`; `signatures` is execTransaction's
+  -- 10th argument (length `sigLen`), read from calldata (head word at 292).
+  function internal reentrancy_trusted checkNSignatures (txHash : Uint256, safeTxHash : Uint256,
+      sigLen : Uint256, t : Uint256)
+    local_obligations [safe_raw_memory_layout := assumed "EIP-1271 call frame built in free memory with mstore/calldatacopy; tested differentially against solc Safe 1.4.1.",
+      safe_low_level_calls := assumed "EIP-1271 isValidSignature is a raw staticcall; its result is the adversary model's."]
+    : Unit := do
     if t > div maxWord 65 then revertEmpty else pure ()
     let staticPart := mul t 65
-    let sigLen := bytesLength signatures
     require (sigLen >= staticPart) "GS020"
+    let ds ← domainSeparatorHash
     let sigBase := add 36 (calldataload 292)
     let mut lastOwner := 0
     forEach "i" t (do
@@ -294,6 +304,35 @@ verity_contract Safe where
       let isOwnerWord ← getMapping owners (wordToAddress currentOwner)
       require (currentOwner > lastOwner && isOwnerWord != 0 && currentOwner != sentinel) "GS026"
       lastOwner := currentOwner)
+
+  -- GS013: with neither safeTxGas nor gasPrice, the inner call must succeed.
+  function internal requireOutcome (success : Uint256, safeTxGas : Uint256, gasPrice_ : Uint256) : Unit := do
+    require (success == 1 || safeTxGas != 0 || gasPrice_ != 0) "GS013"
+
+  -- handlePayment's amount: (gasUsed + baseGas) * price, price = min(gasPrice, tx.gasprice) for ETH and
+  -- gasPrice for a token; SafeMath overflow reverts empty.
+  function internal paymentAmount (gasUsed : Uint256, baseGas : Uint256, gasPrice_ : Uint256,
+      gasToken : Address, txPrice : Uint256) : Uint256 := do
+    if gasUsed > sub maxWord baseGas then revertEmpty else pure ()
+    let base := add gasUsed baseGas
+    let price := if gasToken == zeroAddress then min gasPrice_ txPrice else gasPrice_
+    if base != 0 && price > div maxWord base then revertEmpty else pure ()
+    return (mul base price)
+
+  -- Safe 1.4.1 `execTransaction`, without guard hooks (no guard can be set).
+  function payable reentrancy_trusted execTransaction (target : Address, value : Uint256,
+      data : Bytes, operation : Uint8, safeTxGas : Uint256, baseGas : Uint256,
+      gasPrice_ : Uint256, gasToken : Address, refundReceiver : Address, signatures : Bytes)
+    local_obligations [safe_raw_memory_layout := assumed "Call frames built in free memory with mstore/calldatacopy; tested differentially against solc Safe 1.4.1.",
+      safe_low_level_calls := assumed "call/delegatecall execution, ETH send and token transfer are raw calls; their effects are the adversary model's."]
+    : Bool := do
+    -- Enum.Operation ABI decoding: values other than 0 and 1 revert.
+    if operation > 1 then revertEmpty else pure ()
+    let (txHash, safeTxHash) ← consumeNonce target value data operation safeTxGas baseGas gasPrice_ gasToken refundReceiver
+    -- checkSignatures(txHash, txHashData, signatures)
+    let t ← getStorage threshold
+    require (t > 0) "GS001"
+    checkNSignatures txHash safeTxHash (bytesLength signatures) t
     -- 1/64 rule and event headroom, Solidity 0.7 wrapping arithmetic.
     let g0 := intrinsic_cancun "gasleft" gasleftLowering [1]
     require (g0 >= add (max (div (mul safeTxGas 64) 63) (add safeTxGas 2500)) 500) "GS010"
@@ -310,23 +349,17 @@ verity_contract Safe where
     let gasEnd := intrinsic_cancun "gasleft" gasleftLowering [5]
     if gasEnd > gasStart then revertEmpty else pure ()
     let gasUsed := sub gasStart gasEnd
-    require (success == 1 || safeTxGas != 0 || gasPrice_ != 0) "GS013"
+    requireOutcome success safeTxGas gasPrice_
     let mut payment := 0
     if gasPrice_ > 0 then
       let txSender ← txOrigin
       let receiver := if refundReceiver == zeroAddress then addressToWord txSender else addressToWord refundReceiver
-      if gasUsed > sub maxWord baseGas then revertEmpty else pure ()
-      let base := add gasUsed baseGas
+      let txPrice ← gasPrice
+      payment ← paymentAmount gasUsed baseGas gasPrice_ gasToken txPrice
       if gasToken == zeroAddress then
-        let txPrice ← gasPrice
-        let price := min gasPrice_ txPrice
-        if base != 0 && price > div maxWord base then revertEmpty else pure ()
-        payment := mul base price
         let sent := call (mul (if payment == 0 then 1 else 0) 2300) receiver payment 0 0 0 0
         require (sent == 1) "GS011"
       else
-        if base != 0 && gasPrice_ > div maxWord base then revertEmpty else pure ()
-        payment := mul base gasPrice_
         let q := mload 64
         unsafe "abi.encodeWithSelector(0xa9059cbb, receiver, payment)" do
           mstore q transferSelector
