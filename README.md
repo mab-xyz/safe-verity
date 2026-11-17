@@ -130,7 +130,7 @@ What the theorems assume, or do not see:
 
 ## Fork bugs found
 
-Each one has a plan in `~/verity`, and has a minimal reproduction in `Repro/` where one exists.
+Each one is tracked as a plan in the maintainers' local checkout of the fork (the file names below; not public). Where one exists, `Repro/` has a minimal reproduction.
 
 - `plan-event-array-param-encoding.md`: events with an `Array` parameter read every element one word off, and
   fail to compile with solc.
